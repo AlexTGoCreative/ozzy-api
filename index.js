@@ -32,7 +32,16 @@ mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
 })
-.then(() => console.log('MongoDB connected'))
+.then(async () => {
+  console.log('MongoDB connected');
+  // Drop stale email index from previous schema
+  try {
+    await mongoose.connection.collection('users').dropIndex('email_1');
+    console.log('Dropped stale email_1 index');
+  } catch (e) {
+    // Index doesn't exist, ignore
+  }
+})
 .catch(err => console.error('MongoDB connection error:', err));
 
 const MD_API_KEY = process.env.METADEFENDER_API_KEY;
@@ -71,6 +80,7 @@ app.post('/auth/register', [
       user: { id: user._id, username: user.username }
     });
   } catch (err) {
+    console.error('Register error:', err);
     res.status(500).json({ message: err.message });
   }
 });
@@ -291,6 +301,73 @@ app.delete('/scan-history', auth, async (req, res) => {
     res.json({ message: 'Scan history cleared' });
   } catch (err) {
     res.status(500).json({ message: err.message });
+  }
+});
+
+// === Agatha Engine Scan (Detection Mode — SDK interface) ===
+const os = require('os');
+const path = require('path');
+const AGATHA_ENGINE_URL = process.env.AGATHA_ENGINE_URL || 'http://localhost:3002';
+
+app.post('/agatha-scan', auth, upload.single('file'), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    // Save file to OS temp directory for the engine to scan
+    const tempPath = path.join(os.tmpdir(), `agatha_${Date.now()}_${file.originalname}`);
+    fs.writeFileSync(tempPath, file.buffer);
+
+    try {
+      const scanRequest = {
+        file_path: tempPath,
+      };
+
+      const response = await axios.post(`${AGATHA_ENGINE_URL}/scan`, scanRequest, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 30000
+      });
+
+      res.json({
+        engine: 'Agatha Detection AI',
+        verdict: response.data.verdict,
+        threat_name: response.data.threat_name || '',
+        malicious_probability: response.data.malicious_probability,
+        benign_probability: response.data.benign_probability,
+        scan_time: new Date().toISOString()
+      });
+    } finally {
+      // Clean up temp file
+      try { fs.unlinkSync(tempPath); } catch (e) { /* ignore */ }
+    }
+  } catch (error) {
+    console.error('Agatha scan error:', error.message);
+    // Return a graceful error so it doesn't break the main scan flow
+    res.status(200).json({
+      engine: 'Agatha Detection AI',
+      verdict: -1,
+      threat_name: '',
+      malicious_probability: 0,
+      benign_probability: 0,
+      error: 'Engine unavailable',
+      scan_time: new Date().toISOString()
+    });
+  }
+});
+
+// === Agatha Engine Config Info ===
+app.get('/agatha-config', auth, async (req, res) => {
+  try {
+    const response = await axios.get(`${AGATHA_ENGINE_URL}/config`, { timeout: 5000 });
+    res.json(response.data);
+  } catch (error) {
+    // Return default config if engine is not reachable
+    res.json({
+      available: false,
+      mode: 'detection',
+    });
   }
 });
 
