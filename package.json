@@ -20,6 +20,7 @@
     "express": "^5.1.0",
     "express-validator": "^7.0.0",
     "jsonwebtoken": "^9.0.0",
+    "koffi": "^2.16.2",
     "mongoose": "^7.0.0",
     "multer": "^1.4.5-lts.2"
   },

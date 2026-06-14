@@ -1,3 +1,6 @@
 .env
 node_modules/
 *.log
+
+# Native engine binaries + models (large, distributed out of band)
+engine/package/

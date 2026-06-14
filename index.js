@@ -129,12 +129,12 @@ app.get('/chat-history', auth, async (req, res) => {
 
 app.post('/chat-history', auth, async (req, res) => {
   try {
-    const { messages, scanData, sandboxData, urlData } = req.body;
+    const { messages, scanData, /* sandboxData, */ urlData } = req.body; // Sandbox disabled
     const chatHistory = new ChatHistory({
       userId: req.user.id,
       messages,
       scanData,
-      sandboxData,
+      // sandboxData, // Sandbox disabled
       urlData
     });
     await chatHistory.save();
@@ -149,7 +149,7 @@ app.post('/chat-history', auth, async (req, res) => {
 app.put('/chat-history/:chatId', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
-    const { messages, scanData, sandboxData, urlData } = req.body;
+    const { messages, scanData, /* sandboxData, */ urlData } = req.body; // Sandbox disabled
 
     const chatHistory = await ChatHistory.findOne({ _id: chatId, userId: req.user.id });
     if (!chatHistory) {
@@ -161,7 +161,7 @@ app.put('/chat-history/:chatId', auth, async (req, res) => {
       {
         messages,
         scanData,
-        sandboxData,
+        // sandboxData, // Sandbox disabled
         urlData,
         lastUpdated: new Date()
       },
@@ -238,23 +238,23 @@ app.get('/scan-url-direct', auth, async (req, res) => {
     }
 });
 
-// === Get Sandbox ===
-app.get('/sandbox/:sha1', auth, async (req, res) => {
-  const { sha1 } = req.params;
-
-  try {
-    const response = await axios.get(`https://api.metadefender.com/v4/hash/${sha1}/sandbox`, {
-      headers: {
-        apikey: MD_API_KEY,
-      },
-    });
-
-    res.json(response.data);
-  } catch (error) {
-    console.error('Error fetching sandbox data:', error.message);
-    res.status(500).json({ error: 'Failed to fetch sandbox data from Metadefender.' });
-  }
-});
+// === Get Sandbox === (disabled — only multiscanning + Agatha are active)
+// app.get('/sandbox/:sha1', auth, async (req, res) => {
+//   const { sha1 } = req.params;
+//
+//   try {
+//     const response = await axios.get(`https://api.metadefender.com/v4/hash/${sha1}/sandbox`, {
+//       headers: {
+//         apikey: MD_API_KEY,
+//       },
+//     });
+//
+//     res.json(response.data);
+//   } catch (error) {
+//     console.error('Error fetching sandbox data:', error.message);
+//     res.status(500).json({ error: 'Failed to fetch sandbox data from Metadefender.' });
+//   }
+// });
   
 // === Scan Status ===
 app.get('/scan/:hash', auth, async (req, res) => {
@@ -304,10 +304,41 @@ app.delete('/scan-history', auth, async (req, res) => {
   }
 });
 
-// === Agatha Engine Scan (Detection Mode — SDK interface) ===
+// === Agatha Engine (in-process, native FFI) ===
+// The native engine DLL is loaded directly into this process via koffi (see
+// ./engine), so there is no separate Node host on :3002. Scans go through the
+// engine's UIF `process` interface, which honours the per-file-type preferences
+// (layer toggles + thresholds) the user configures in the Settings panel.
 const os = require('os');
 const path = require('path');
-const AGATHA_ENGINE_URL = process.env.AGATHA_ENGINE_URL || 'http://localhost:3002';
+const agathaEngine = require('./engine');
+
+// Map the engine's string verdict to the numeric verdict + probability pair the
+// frontend's ScanResults component expects.
+//   0 = clean · 1 = malicious · 2 = unknown · 3 = unsupported · -1 = unavailable
+function mapEngineResult(result) {
+  if (!result.ok) {
+    return { verdict: -1, threat_name: '', malicious_probability: 0, benign_probability: 0, error: result.error || 'Engine unavailable' };
+  }
+  const conf = Math.max(0, Math.min(100, result.confidence));
+  switch (result.verdict) {
+    case 'malicious':
+      return {
+        verdict: 1,
+        threat_name: `${result.fileType || 'Agatha'}/malicious_${Math.round(conf)}`,
+        malicious_probability: conf,
+        benign_probability: 100 - conf,
+      };
+    case 'clean':
+      return { verdict: 0, threat_name: '', malicious_probability: 100 - conf, benign_probability: conf };
+    case 'unknown':
+      return { verdict: 2, threat_name: '', malicious_probability: conf, benign_probability: 100 - conf };
+    case 'unsupported':
+      return { verdict: 3, threat_name: '', malicious_probability: 0, benign_probability: 0 };
+    default:
+      return { verdict: -1, threat_name: '', malicious_probability: 0, benign_probability: 0, error: 'Unrecognized verdict' };
+  }
+}
 
 app.post('/agatha-scan', auth, upload.single('file'), async (req, res) => {
   try {
@@ -316,37 +347,38 @@ app.post('/agatha-scan', auth, upload.single('file'), async (req, res) => {
       return res.status(400).json({ message: 'No file uploaded' });
     }
 
-    // Save file to OS temp directory for the engine to scan
+    // Per-file-type preferences chosen in the Settings panel. Sent as a JSON
+    // string form field; absent/invalid means "use the engine profile defaults".
+    let preferences = null;
+    if (req.body?.preferences) {
+      try {
+        const parsed = JSON.parse(req.body.preferences);
+        if (parsed && typeof parsed === 'object') preferences = parsed;
+      } catch (e) {
+        console.warn('[agatha] Ignoring malformed preferences payload:', e.message);
+      }
+    }
+
+    // The engine scans a path on disk, so stage the upload in the OS temp dir.
     const tempPath = path.join(os.tmpdir(), `agatha_${Date.now()}_${file.originalname}`);
     fs.writeFileSync(tempPath, file.buffer);
 
     try {
-      const scanRequest = {
-        file_path: tempPath,
-      };
-
-      const response = await axios.post(`${AGATHA_ENGINE_URL}/scan`, scanRequest, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 30000
-      });
-
+      const result = agathaEngine.scan(tempPath, preferences);
       res.json({
-        engine: 'Agatha Detection AI',
-        verdict: response.data.verdict,
-        threat_name: response.data.threat_name || '',
-        malicious_probability: response.data.malicious_probability,
-        benign_probability: response.data.benign_probability,
-        scan_time: new Date().toISOString()
+        engine: 'Agatha',
+        ...mapEngineResult(result),
+        file_type: result.fileType || undefined,
+        scan_time: new Date().toISOString(),
       });
     } finally {
-      // Clean up temp file
       try { fs.unlinkSync(tempPath); } catch (e) { /* ignore */ }
     }
   } catch (error) {
     console.error('Agatha scan error:', error.message);
     // Return a graceful error so it doesn't break the main scan flow
     res.status(200).json({
-      engine: 'Agatha Detection AI',
+      engine: 'Agatha',
       verdict: -1,
       threat_name: '',
       malicious_probability: 0,
@@ -357,18 +389,26 @@ app.post('/agatha-scan', auth, upload.single('file'), async (req, res) => {
   }
 });
 
+// === Agatha Engine Workflow Schema ===
+// Returns the per-rule settings schema the engine exposes (one feature group per
+// file-type family). The Settings panel renders its controls directly from this,
+// so the UI always matches what the engine actually supports.
+app.get('/agatha-workflow-info', auth, async (req, res) => {
+  const info = agathaEngine.getWorkflowInfo();
+  if (!info) {
+    return res.status(200).json({ available: false });
+  }
+  res.json({ available: true, ...info });
+});
+
 // === Agatha Engine Config Info ===
 app.get('/agatha-config', auth, async (req, res) => {
-  try {
-    const response = await axios.get(`${AGATHA_ENGINE_URL}/config`, { timeout: 5000 });
-    res.json(response.data);
-  } catch (error) {
-    // Return default config if engine is not reachable
-    res.json({
-      available: false,
-      mode: 'detection',
-    });
-  }
+  res.json({
+    available: agathaEngine.isReady(),
+    mode: 'detection',
+    verdicts: ['Clean', 'Infected', 'Unknown', 'Unsupported'],
+    supported_file_types: ['PE', 'ELF', 'Mach-O', 'PDF', 'OOXML', 'Image'],
+  });
 });
 
 const PORT = process.env.PORT || 5000;
