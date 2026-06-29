@@ -1,0 +1,11 @@
+# Keep the build context small & reproducible. The engine .so/.dll binaries and
+# .onnx models under engine/package and url-engine/package ARE needed, so they
+# are intentionally NOT ignored here.
+node_modules
+npm-debug.log
+.env
+.env.*
+*.log
+.git
+Dockerfile
+.dockerignore

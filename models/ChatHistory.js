@@ -33,6 +33,12 @@ const chatHistorySchema = new mongoose.Schema({
     type: mongoose.Schema.Types.Mixed,
     default: null
   },
+  // Per-file AGATHA engine verdict for file scans, persisted so a reloaded
+  // conversation can still explain the AI verdict without re-scanning.
+  agathaData: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
   createdAt: {
     type: Date,
     default: Date.now

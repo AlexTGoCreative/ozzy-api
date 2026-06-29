@@ -15,7 +15,7 @@ const jwt = require('jsonwebtoken');
 dotenv.config();
 
 const app = express();
-const upload = multer();
+const upload = multer({ limits: { fileSize: 2 * 1024 * 1024 * 1024 } }); // 2 GB
 
 const corsOptions = {
   origin: '*', 
@@ -74,7 +74,7 @@ app.post('/auth/register', [
     const user = new User({ username, password });
     await user.save();
 
-    const token = jwt.sign({ id: user._id }, JWT_SECRET);
+    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '7d' });
     res.json({
       token,
       user: { id: user._id, username: user.username }
@@ -107,7 +107,7 @@ app.post('/auth/login', [
       return res.status(400).json({ message: 'Invalid credentials' });
     }
 
-    const token = jwt.sign({ id: user._id }, JWT_SECRET);
+    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '7d' });
     res.json({
       token,
       user: { id: user._id, username: user.username }
@@ -129,13 +129,14 @@ app.get('/chat-history', auth, async (req, res) => {
 
 app.post('/chat-history', auth, async (req, res) => {
   try {
-    const { messages, scanData, /* sandboxData, */ urlData } = req.body; // Sandbox disabled
+    const { messages, scanData, /* sandboxData, */ urlData, agathaData } = req.body; // Sandbox disabled
     const chatHistory = new ChatHistory({
       userId: req.user.id,
       messages,
       scanData,
       // sandboxData, // Sandbox disabled
-      urlData
+      urlData,
+      agathaData
     });
     await chatHistory.save();
     res.json(chatHistory);
@@ -149,7 +150,7 @@ app.post('/chat-history', auth, async (req, res) => {
 app.put('/chat-history/:chatId', auth, async (req, res) => {
   try {
     const { chatId } = req.params;
-    const { messages, scanData, /* sandboxData, */ urlData } = req.body; // Sandbox disabled
+    const { messages, scanData, /* sandboxData, */ urlData, agathaData } = req.body; // Sandbox disabled
 
     const chatHistory = await ChatHistory.findOne({ _id: chatId, userId: req.user.id });
     if (!chatHistory) {
@@ -163,6 +164,7 @@ app.put('/chat-history/:chatId', auth, async (req, res) => {
         scanData,
         // sandboxData, // Sandbox disabled
         urlData,
+        agathaData,
         lastUpdated: new Date()
       },
       { new: true }
@@ -238,6 +240,64 @@ app.get('/scan-url-direct', auth, async (req, res) => {
     }
 });
 
+// === Agatha URL Engine Scan (in-process, native FFI) ===
+// Classifies a single URL with the Hyperlink ONNX engine. Returns the same
+// verdict shape the frontend's ScanResults uses for the file Agatha engine so
+// the two can be compared side by side:
+//   0 = clean · 1 = malicious · 2 = suspicious · -1 = unavailable
+app.get('/agatha-url-scan', auth, async (req, res) => {
+  // `mode` is accepted for parity with the file scan but the URL engine is
+  // mode-agnostic for now; we just don't choke on it.
+  const { url } = req.query;
+  if (!url) {
+    return res.status(400).json({ error: 'Missing url' });
+  }
+
+  try {
+    const result = await agathaUrlEngine.scanAsync(url);
+
+    if (!result.ok) {
+      return res.status(200).json({
+        engine: 'Agatha URL',
+        verdict: -1,
+        threat_name: '',
+        malicious_probability: 0,
+        benign_probability: 0,
+        url,
+        error: result.error || 'Engine unavailable',
+        scan_time: new Date().toISOString(),
+        engine_logs: result.logs || '',
+      });
+    }
+
+    const mal = result.malicious_probability;
+    res.json({
+      engine: 'Agatha URL',
+      verdict: result.verdict,
+      threat_name: result.verdict === 1 ? `Hyperlink/malicious_${Math.round(mal)}` : '',
+      malicious_probability: mal,
+      benign_probability: result.benign_probability,
+      url: result.url,
+      scan_time: new Date().toISOString(),
+      // Per-scan engine diagnostics (matches /agatha-scan's engine_logs shape).
+      engine_logs: result.logs || '',
+    });
+  } catch (error) {
+    console.error('Agatha URL scan error:', error.message);
+    res.status(200).json({
+      engine: 'Agatha URL',
+      verdict: -1,
+      threat_name: '',
+      malicious_probability: 0,
+      benign_probability: 0,
+      url,
+      error: 'Engine unavailable',
+      scan_time: new Date().toISOString(),
+      engine_logs: '',
+    });
+  }
+});
+
 // === Get Sandbox === (disabled — only multiscanning + Agatha are active)
 // app.get('/sandbox/:sha1', auth, async (req, res) => {
 //   const { sha1 } = req.params;
@@ -311,7 +371,11 @@ app.delete('/scan-history', auth, async (req, res) => {
 // (layer toggles + thresholds) the user configures in the Settings panel.
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const agathaEngine = require('./engine');
+// Agatha URL (Hyperlink) engine — same in-process FFI pattern as the file
+// engine above, but classifies URLs instead of files.
+const agathaUrlEngine = require('./url-engine');
 
 // Map the engine's string verdict to the numeric verdict + probability pair the
 // frontend's ScanResults component expects.
@@ -360,16 +424,28 @@ app.post('/agatha-scan', auth, upload.single('file'), async (req, res) => {
     }
 
     // The engine scans a path on disk, so stage the upload in the OS temp dir.
-    const tempPath = path.join(os.tmpdir(), `agatha_${Date.now()}_${file.originalname}`);
+    // Include a random suffix so concurrent scans (up to 8 in flight) can't
+    // collide on the same temp filename within the same millisecond.
+    const unique = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+    const tempPath = path.join(os.tmpdir(), `agatha_${unique}_${file.originalname}`);
     fs.writeFileSync(tempPath, file.buffer);
 
+    // Scan mode: 'detection' (default, low-FP) or 'deflection' (low-FN). Sent as
+    // a multipart form field. The engine falls back to detection if the
+    // deflection binary is not loaded; result.mode reflects what actually ran.
+    const mode = req.body?.mode === 'deflection' ? 'deflection' : 'detection';
+
     try {
-      const result = agathaEngine.scan(tempPath, preferences);
+      const result = await agathaEngine.scanAsync(tempPath, preferences, mode);
       res.json({
         engine: 'Agatha',
         ...mapEngineResult(result),
+        mode: result.mode || mode,
         file_type: result.fileType || undefined,
         scan_time: new Date().toISOString(),
+        // Raw engine diagnostics for this scan (feature vector, scan layers,
+        // inference verdict, scored deepscan URLs). Surfaced in the UI "Logs" panel.
+        engine_logs: result.logs || '',
       });
     } finally {
       try { fs.unlinkSync(tempPath); } catch (e) { /* ignore */ }
@@ -384,7 +460,8 @@ app.post('/agatha-scan', auth, upload.single('file'), async (req, res) => {
       malicious_probability: 0,
       benign_probability: 0,
       error: 'Engine unavailable',
-      scan_time: new Date().toISOString()
+      scan_time: new Date().toISOString(),
+      engine_logs: ''
     });
   }
 });
@@ -394,18 +471,31 @@ app.post('/agatha-scan', auth, upload.single('file'), async (req, res) => {
 // file-type family). The Settings panel renders its controls directly from this,
 // so the UI always matches what the engine actually supports.
 app.get('/agatha-workflow-info', auth, async (req, res) => {
-  const info = agathaEngine.getWorkflowInfo();
+  // The threshold defaults are mode-specific (detection vs deflection profiles),
+  // so the UI passes ?mode= and we return that mode's schema. Unknown/absent mode
+  // falls back to detection. If the deflection engine is unavailable the engine
+  // layer transparently falls back to the detection schema.
+  const mode = req.query.mode === 'deflection' ? 'deflection' : 'detection';
+  const info = agathaEngine.getWorkflowInfo(mode);
   if (!info) {
-    return res.status(200).json({ available: false });
+    return res.status(200).json({ available: false, mode });
   }
-  res.json({ available: true, ...info });
+  res.json({ available: true, mode, ...info });
 });
 
 // === Agatha Engine Config Info ===
 app.get('/agatha-config', auth, async (req, res) => {
+  const deflectionAvailable =
+    typeof agathaEngine.deflectionAvailable === 'function'
+      ? agathaEngine.deflectionAvailable()
+      : false;
   res.json({
     available: agathaEngine.isReady(),
+    // Backward-compatible: keep `mode` as the default mode; add the dual-mode
+    // fields the mode-aware frontend reads.
     mode: 'detection',
+    modes: ['detection', 'deflection'],
+    deflection_available: deflectionAvailable,
     verdicts: ['Clean', 'Infected', 'Unknown', 'Unsupported'],
     supported_file_types: ['PE', 'ELF', 'Mach-O', 'PDF', 'OOXML', 'Image'],
   });

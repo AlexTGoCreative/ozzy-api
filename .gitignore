@@ -4,3 +4,4 @@ node_modules/
 
 # Native engine binaries + models (large, distributed out of band)
 engine/package/
+url-engine/package/
